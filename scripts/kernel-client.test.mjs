@@ -49,6 +49,10 @@ test('2.x SDK 请求合约：分页、目录、鉴权、模型选择、附件、
     const body = init?.body ? JSON.parse(init.body) : undefined
     const path = u.pathname
     requests.push({ url: u, method: init?.method, headers: new Headers(init?.headers), body })
+    // The 2.x kernel rejects a cursor combined with order: the cursor already
+    // carries the requested order. Mirroring that here catches a regression in
+    // the adapter's pagination contract.
+    if (u.searchParams.has('cursor') && u.searchParams.has('order')) return new Response(JSON.stringify({ message: 'Cursor cannot be combined with order' }), { status: 400, headers: { 'Content-Type': 'application/json' } })
     let output
     if (path === '/api/session' && init.method === 'GET') output = { data: u.searchParams.get('cursor') ? [] : [session], cursor: { next: u.searchParams.get('cursor') ? null : 'page2' } }
     else if (path === '/api/session' && init.method === 'POST') output = { data: session }
@@ -85,6 +89,16 @@ test('2.x SDK 请求合约：分页、目录、鉴权、模型选择、附件、
     const messages = (await client.session.messages({ path: { id: 'session' } })).data
     assert.equal(messages.length, 2)
     assert.equal(messages[1].info.parentID, 'user')
+    // Order belongs to the first page only; every cursor page must omit it or
+    // the real kernel answers 400 "Cursor cannot be combined with order".
+    const listPages = requests.filter(r => r.url.pathname === '/api/session' && r.method === 'GET')
+    const messagePages = requests.filter(r => r.url.pathname === '/api/session/session/message')
+    assert.equal(listPages.length, 2, 'session list is paged')
+    assert.equal(listPages[0].url.searchParams.get('order'), 'desc')
+    assert.ok(listPages[1].url.searchParams.has('cursor') && !listPages[1].url.searchParams.has('order'), 'session list cursor page omits order')
+    assert.equal(messagePages.length, 2, 'message history is paged')
+    assert.equal(messagePages[0].url.searchParams.get('order'), 'asc')
+    assert.ok(messagePages[1].url.searchParams.has('cursor') && !messagePages[1].url.searchParams.has('order'), 'message cursor page omits order')
     await client.session.promptAsync({ path: { id: 'session' }, body: { model: { providerID: 'provider', modelID: 'model' }, variant: 'high', parts: [{ type: 'text', text: '问题' }, { type: 'file', filename: 'a.png', url: 'data:image/png;base64,YQ==' }] } })
     const prompt = requests.find(r => r.url.pathname.endsWith('/prompt'))
     assert.equal(prompt.body.files[0].uri, 'data:image/png;base64,YQ==')
@@ -223,4 +237,31 @@ test('2.x 重连历史恢复工具状态，迟到历史不覆盖新一轮父消�
   projection.history('session', [{ type: 'user', id: 'old-user' }], false)
   const meta = projection.events(event('session.step.started', { assistantMessageID: 'new-assistant', model: { id: 'model', providerID: 'provider' } }))[0]
   assert.equal(meta.properties.info.parentID, 'new-user')
+})
+
+test('2.x 事件订阅不带 Accept 头，也不会被普通读取时限中止', async () => {
+  const original = globalThis.fetch
+  const directory = 'E:\\工作空间 A'
+  let streamSignal
+  let streamHeaders
+  const errors = []
+  globalThis.fetch = async (input, init) => {
+    const u = new URL(input instanceof Request ? input.url : String(input))
+    if (u.pathname === '/api/event') {
+      streamSignal = init?.signal
+      streamHeaders = new Headers(init?.headers)
+      return new Response(new ReadableStream({ start() {} }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    }
+    return new Response('{}', { headers: { 'Content-Type': 'application/json' } })
+  }
+  // A short deadline makes a leaked read timeout observable within the test.
+  const client = createKernelClient({ protocol: 'v2', url: 'http://127.0.0.1:1234', headers: {} }, directory, { readTimeoutMs: 40 })
+  client.subscribe({ open() {}, error(error) { errors.push(error) }, event() {} })
+  try {
+    await new Promise(resolve => setTimeout(resolve, 120))
+    assert.ok(streamSignal, 'event stream was requested')
+    assert.equal(streamHeaders.get('accept'), null, '2.x event subscription sends no Accept header')
+    assert.equal(streamSignal.aborted, false, 'event stream must not inherit the read deadline')
+    assert.equal(errors.length, 0, 'a live event stream must not report a connection failure')
+  } finally { client.dispose(); globalThis.fetch = original }
 })

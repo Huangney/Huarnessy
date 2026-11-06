@@ -201,5 +201,33 @@ module.exports = async () => {
   window.benchEmit('message.removed', { sessionID: 'benchmark-session', messageID: 'question-message' })
   await waitFor(() => !document.querySelector('.hui-question-tool'))
   await new Promise(resolve => setTimeout(resolve, 180))
+
+  // A failed history refresh must not stay on screen after a later one succeeds.
+  window.benchMessagesFailure = true
+  window.benchEmit('session.idle', { sessionID: 'benchmark-session' })
+  await waitFor(() => document.body.textContent.includes('刷新会话历史失败'))
+  window.benchMessagesFailure = false
+  window.benchEmit('session.idle', { sessionID: 'benchmark-session' })
+  await waitFor(() => !document.body.textContent.includes('刷新会话历史失败'))
+  check(!document.body.textContent.includes('刷新会话历史失败'), 'a successful history refresh clears the persistent error')
+
+  // Dropping the event stream must not disable a focused textarea: that aborts
+  // an IME composition and commits its raw pinyin into the input value.
+  const pinyin = "kan'kan'ni'd'gong'zuo'mu'lu"
+  setText(pinyin)
+  textarea.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: pinyin }))
+  window.benchSource.onerror?.()
+  await waitFor(() => !!document.querySelector('[data-hui-event-lost]'))
+  check(!textarea.disabled, 'event connection loss keeps the composer editable during IME composition')
+  check(textarea.value === pinyin, 'a dropped event stream does not commit the IME composition')
+  const sendButton = () => Array.from(document.querySelectorAll('button')).find(button => button.textContent.trim() === '发送')
+  check(!!sendButton()?.disabled, 'sending stays blocked while the event stream is down')
+  check(!document.body.textContent.includes('事件连接失败：'), 'a transient stream drop is not reported as a connection failure')
+  textarea.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: pinyin }))
+  window.benchSource.onopen?.()
+  await waitFor(() => !document.querySelector('[data-hui-event-lost]'))
+  check(!textarea.disabled, 'the composer stays editable after the event stream recovers')
+  setText('')
+  await new Promise(resolve => setTimeout(resolve, 200))
   return passed
 }

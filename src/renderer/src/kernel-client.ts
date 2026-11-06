@@ -68,7 +68,11 @@ export function createKernelClient(connection: KernelConnection, directory: stri
     const method = init?.method ?? (input instanceof Request ? input.method : 'GET')
     const signals = [lifetime.signal, ...(signal ? [signal] : [])]
     const endpoint = new URL(input instanceof Request ? input.url : String(input)).pathname
-    if (method === 'GET' && accept !== 'text/event-stream') {
+    // The 2.x SDK subscribes to GET /api/event without an Accept header, so
+    // recognise long-lived event streams by path as well. A read deadline on
+    // that stream aborts it every 15s as "Transport: BodyStreamBuffer was aborted".
+    const eventStream = accept === 'text/event-stream' || /(?:^|\/)event(?:\/|$)/.test(endpoint)
+    if (method === 'GET' && !eventStream) {
       // Listing commands/skills aggregates MCP prompts, which can block until
       // every MCP server has settled. Treat that as a slow read, not a failure.
       signals.push(AbortSignal.timeout(/\/(command|skill)$/.test(endpoint) ? listingTimeoutMs : readTimeoutMs))
@@ -157,6 +161,9 @@ export function createKernelClient(connection: KernelConnection, directory: stri
     do {
       const response = await load(cursor)
       items.push(...response.data)
+      // The kernel returns a next cursor whenever a page has a last item, even
+      // when that page is the last one. Stop on the following empty page.
+      if (!response.data.length) break
       cursor = response.cursor.next ?? undefined
       if (cursor && seen.has(cursor)) throw new Error('内核返回了重复的分页游标')
       if (cursor) seen.add(cursor)
@@ -171,11 +178,19 @@ export function createKernelClient(connection: KernelConnection, directory: stri
       if (session.model) await sdk.session.switchModel({ sessionID, model: { ...session.model, variant: body.variant } })
     }
   }
+  // 2.x cursors already encode order. Sending both from the second page on is
+  // rejected with "Cursor cannot be combined with order", so order is only a
+  // first-page parameter.
+  const paged = <T,>(first: (cursor?: string) => Promise<{ data: T[]; cursor: { next?: string | null } }>, rest: (cursor: string) => Promise<{ data: T[]; cursor: { next?: string | null } }>) =>
+    pages<T>(cursor => cursor ? rest(cursor) : first())
   const client: KernelClient = {
     diagnostics: () => diagnostics.slice(),
     dispose,
     session: {
-      list: async () => result((await pages(cursor => sdk.session.list({ directory, order: 'desc', limit: 100, cursor }))).map(s => projection.session(s)).filter(s => sameWorkspace(s.directory, directory))),
+      list: async () => result((await paged(
+        () => sdk.session.list({ directory, order: 'desc', limit: 100 }),
+        cursor => sdk.session.list({ directory, limit: 100, cursor })
+      )).map(s => projection.session(s)).filter(s => sameWorkspace(s.directory, directory))),
       create: async input => result(projection.session(await sdk.session.create({ location, title: input?.body?.title }))),
       get: async input => result(projection.session(await sdk.session.get({ sessionID: await scope(input) }))),
       delete: async input => {
@@ -186,7 +201,10 @@ export function createKernelClient(connection: KernelConnection, directory: stri
       messages: async input => {
         const sessionID = await scope(input)
         const revision = projection.revision
-        const messages = await pages(cursor => sdk.message.list({ sessionID, order: 'asc', limit: 100, cursor }))
+        const messages = await paged(
+          () => sdk.message.list({ sessionID, order: 'asc', limit: 100 }),
+          cursor => sdk.message.list({ sessionID, limit: 100, cursor })
+        )
         // A late REST response must not replace metadata already received on the live stream.
         return result(projection.history(sessionID, messages, revision === projection.revision))
       },
@@ -331,7 +349,14 @@ export function createKernelClient(connection: KernelConnection, directory: stri
               }
             }
             if (!signal.aborted) throw new Error('内核事件连接已关闭')
-          } catch (error) { if (signal.aborted) break; handlers.error(handshake.signal.aborted ? handshake.signal.reason : error) }
+          } catch (error) {
+            if (signal.aborted) break
+            // A dropped stream is normal churn that the retry loop repairs.
+            // Only handshake timeouts and repeated failures are surfaced as a
+            // connection error; one transient abort must not alarm the composer.
+            if (handshake.signal.aborted || retry >= 3) handlers.error(handshake.signal.aborted ? handshake.signal.reason : error)
+            else handlers.error()
+          }
           finally { clearTimeout(handshakeTimer) }
           const ms = [1000, 2000, 4000, 8000, 10000][Math.min(retry++, 4)]
           await new Promise<void>(resolve => {

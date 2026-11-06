@@ -104,6 +104,7 @@ window.fetch = async (url, options) => {
     data = window.benchSessions.find(session => session.id === path.split('/')[2]) ?? null
   }
   else if (/^\/session\/[^/]+\/message$/.test(path)) {
+    if (window.benchMessagesFailure) throw new Error('Cursor cannot be combined with order')
     const id = path.split('/')[2]
     data = window.benchMessages[id] ?? []
     if (window.benchHoldMessages === id) await new Promise(resolve => { window.benchReleaseMessages = resolve })

@@ -1309,6 +1309,8 @@ export default function App(): React.ReactElement {
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [draggingFiles, setDraggingFiles] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  // Track IME composition so connection churn cannot disable the focused composer.
+  const composing = useRef(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const attachmentEpoch = useRef(0)
   const [questions, setQuestions] = useState<QuestionRequest[]>([])
@@ -1891,6 +1893,8 @@ export default function App(): React.ReactElement {
         flushEvents()
         const snapshot: MessageEntry[] = unwrap(r) ?? []
         setMessages(snapshot)
+        // A successful reconciliation clears the otherwise persistent history error.
+        setLastError(previous => previous?.startsWith('刷新会话历史失败：') ? null : previous)
         setReverted(previous => previous?.sessionId === id && !snapshot.some(message => previous.hiddenIds.has(message.info?.id)) ? null : previous)
       } catch (e) {
         if (c === clientRef.current && epoch === sessionEpoch.current && id === activeIdRef.current) setLastError(`刷新会话历史失败：${e instanceof Error ? e.message : String(e)}`)
@@ -2588,9 +2592,13 @@ export default function App(): React.ReactElement {
     }
   }
 
+  // Disabling a focused textarea aborts an IME composition and commits
+  // its pinyin buffer. A dropped event stream must only block sending.
+  const composerUnavailable = server?.status !== 'ready' || initializing || !workspace
   // Falls through to a normal prompt (which itself may dispatch a
   // user-defined `/command`) when the input is not a built-in command.
   const submit = async (): Promise<void> => {
+    if (composing.current) return
     const match = /^\/(\S+)(?:\s+[\s\S]*)?$/.exec(input.trim())
     const builtin = match ? builtinCommands.find(item => item.name === match[1].toLowerCase()) : undefined
     if (!builtin) { await send(); return }
@@ -2966,6 +2974,8 @@ export default function App(): React.ReactElement {
                 ref={textareaRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
+                onCompositionStart={() => { composing.current = true }}
+                onCompositionEnd={() => { composing.current = false }}
                 onPaste={(event: ClipboardEvent<HTMLTextAreaElement>) => {
                   const files = Array.from(event.clipboardData.files)
                   if (files.length) { event.preventDefault(); void addFiles(files) }
@@ -3006,7 +3016,7 @@ export default function App(): React.ReactElement {
                     ? '输入消息… (Enter 发送 / Shift+Enter 换行 / 输入 / 使用命令 / 输入 @ 引用文件)'
                     : '等待 opencode 启动…'
                 }
-                disabled={server?.status !== 'ready' || initializing || eventLost || !workspace}
+                disabled={composerUnavailable && !composing.current}
                 className="hui-composer-textarea min-h-[64px] w-full resize-none bg-transparent px-3 py-1.5 text-[13.5px] text-white/90 outline-none placeholder:text-white/35 disabled:opacity-50"
               />
               <div className="mt-1 flex items-center gap-2 px-0.5">

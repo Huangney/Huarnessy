@@ -257,10 +257,10 @@ npm run test:stream -- --layout-only  # 只验证流式气泡尺寸、滚动与�
 
 ### 双版本通信与连接界面
 
-- `kernel-client.ts` 是渲染层唯一协议入口：1.x 封装 `@opencode-ai/sdk`，2.x 固定 `@opencode/client@2.0.32` Promise 客户端；界面及 PermissionGate 不再创建独立 SDK。每个客户端绑定目录与 AbortController，工作空间切换关闭事件流并取消旧请求。普通 GET 读取限时 15 秒；`/command`、`/api/command`、`/api/skill` 会等待 MCP prompts，单独使用 120 秒时限，避免 MCP 冷启动（如 npx/远程 server）被误判为连接故障。
-- `kernel-projection.ts` 将 2.x 原生 session.text/reasoning/tool/step/execution/compaction 事件投影到原有有序归并队列。正文及思考 ID 是 message ID + content ordinal，工具 ID 是 message ID + tool ID；结束事件是完整快照替换，不能再次追加。2.x 全局事件先按 location/已验证会话归属过滤，所有 HTTP 请求额外携带编码的 x-opencode-directory。列表及消息历史遍历分页。
+- `kernel-client.ts` 是渲染层唯一协议入口：1.x 封装 `@opencode-ai/sdk`，2.x 固定 `@opencode/client@2.0.32` Promise 客户端；界面及 PermissionGate 不再创建独立 SDK。每个客户端绑定目录与 AbortController，工作空间切换关闭事件流并取消旧请求。普通 GET 读取限时 15 秒，但事件流（`Accept: text/event-stream` 或路径含 `/event`）必须排除：`@opencode/client` 的 `/api/event` 订阅不发 Accept 头，套用该时限会周期性 abort 长连接并报 `Transport: BodyStreamBuffer was aborted`；`/command`、`/api/command`、`/api/skill` 会等待 MCP prompts，单独使用 120 秒时限，避免 MCP 冷启动（如 npx/远程 server）被误判为连接故障。
+- `kernel-projection.ts` 将 2.x 原生 session.text/reasoning/tool/step/execution/compaction 事件投影到原有有序归并队列。正文及思考 ID 是 message ID + content ordinal，工具 ID 是 message ID + tool ID；结束事件是完整快照替换，不能再次追加。2.x 全局事件先按 location/已验证会话归属过滤，所有 HTTP 请求额外携带编码的 x-opencode-directory。列表及消息历史遍历分页；2.x 的 cursor 已编码 order，`order` 只能出现在首页，后续游标页再传会被内核以 `Cursor cannot be combined with order` 拒绝，空页即停止翻页。
 - 2.x 会话模型、Agent 由 switchModel/switchAgent 切换；文件使用原生 URI 附件，压缩/停止/撤回/恢复分别映射原生接口。权限字段 action/resources/save 映射旧 UI；Form 通过 KernelFormDialog 展示文本、数字、整数、布尔、单选、多选、条件字段及外部步骤。
-- 2.x 事件通过 SDK 的 fetch 流携带鉴权，以 1/2/4/8/10 秒间隔重连；重连补查历史、模型、会话、运行状态、授权及待答表单，写操作不重放。1.x 保留原生 EventSource 自动重连。Markdown Worker、缓存和有界格式化队列保持原机制。
+- 2.x 事件通过 SDK 的 fetch 流携带鉴权，以 1/2/4/8/10 秒间隔重连；流关闭或传输中断属于正常抖动，由重连循环静默恢复，只有握手超时或连续失败才向界面上报「事件连接失败」。重连补查历史、模型、会话、运行状态、授权及待答表单，写操作不重放。1.x 保留原生 EventSource 自动重连。Markdown Worker、缓存和有界格式化队列保持原机制。
 - 标题栏文字状态可打开 ConnectionStatus 诊断面板；空白聊天页展示启动进度、失败原因和重试/选内核/恢复自动选择。会话/模型/命令加载失败在界面显示，空模型列表提示检查配置；诊断复制只序列化 ServerInfo，不包含连接凭据。命令列表不阻塞首次初始化：失败时保留内置命令，并按 3/10/30 秒自动重试，首次 SSE 握手成功后也会补拉；成功即清除提示。
 - `npm run test:kernel` 同时运行启动与协议测试；协议测试使用 SDK 真实序列化和独立 HTTP 假响应，不代表真实模型输出速度。
 - `npm run test:kernel-ui`（可加 `--production`）使用独立 2.x HTTP/SSE 假内核，覆盖状态快照竞态、进度/失败/诊断复制、选择与重试防重、分页、原生流式去重、目录过滤、权限、条件数字表单及断线恢复。生产测试前先 build；测试截图仅写入 out/。
@@ -274,6 +274,13 @@ npm run test:stream -- --layout-only  # 只验证流式气泡尺寸、滚动与�
 - 独立 2.0.32 HTTP/SSE 假内核的开发与生产 UI 回归（11 项）通过；诊断面板另有截图检查及窗口内定位断言。
 - test:stream 常规开发、开发 --large 和 --production 通过。长输入分别为列表 17,300 字符、段落 20,640 字符、多段落 8,803 字符、代码 28,818 字符。均为假内核受控输入，不代表真实模型速度。
 - 真实 1.18.29 与 2.0.32 在隔离的临时配置/数据目录中通过开发和 file:// 生产页面的健康接口、SDK 会话/配置、目录及鉴权 SSE 检查，没有发送真实模型请求。其他版本未据此宣称已完整验证。
+
+### 会话刷新与输入稳定性修复（2026-11-06）
+
+- 用户提供录屏复现了三个现象：`刷新会话历史失败：Cursor cannot be combined with order` 常驻、偶发 `事件连接失败：Transport: BodyStreamBuffer was aborted`、断连瞬间输入法拼音 `li'm you'shen'me'dong'xi` 被上屏。
+- 根因链：2.x 消息分页第二页重复传 `order`；`/api/event` 没有 Accept 头，被 15 秒读取时限误杀；`eventLost` 把 textarea 置为 `disabled`，浏览器因此结束 IME 组合。
+- 回归：`kernel-client.test.mjs` 用假内核复现 cursor/order 服务端校验与无 Accept 头的事件流（13 项）；`composer-regressions.cjs` 覆盖历史失败提示清除、组合中输入框保持可编辑、发送仍被阻止、瞬断不上报故障、恢复后可编辑（composer 43 项）。把旧超时判断临时还原时新增协议测试如期失败，确认不是空断言。
+- 验证：`npm run typecheck`、`npm run build`、`npm run test:kernel`、`npm run test:stream` 开发与生产、`npm run test:kernel-ui` 开发与生产全部通过。流式耗时来自假内核，不代表真实模型速度。
 
 ## 7. 环境与已知坑
 
@@ -308,7 +315,7 @@ npm run test:stream -- --layout-only  # 只验证流式气泡尺寸、滚动与�
 ### 会话忙碌状态
 
 - `App.tsx` 用 `busySessions` 集合按会话记录运行状态，`busy` 由当前活动会话推导。从正在生成的会话切换到空闲会话时右下角显示“发送”而非错误地沿用“停止”，切回仍在工作的会话会恢复“停止”。发送、内置压缩标记当前会话；`session.idle` / `session.error` 无论会话是否为当前活动都会清除对应标记；工作空间切换、删除会话与撤回成功分别清理相关标记。假内核回归见 `scripts/busy-session-regressions.cjs`。
-- `session.status` 的 `retry` 状态也在界面显式呈现：当前会话在输入框上方显示黄色「模型连接中断」提示，包含尝试次数、倒计时、内核返回的错误摘要；侧栏对应会话带脉动圆点，切到其他会话时提示消失但侧栏标记保留。`retry` 期间仍视为忙碌（保留「停止」），`busy` 只清除提示，`idle` / `session.error` 同时清除提示和标记。主 SSE 断开时输入框上方显示蓝色「与内核的连接中断，正在重连…」；`EventSource` 重连成功后重新拉取历史、会话列表与 `/session/status`，弥补断线期间丢失的事件。系统减少动态效果时圆点停止脉动。回归见 `scripts/busy-session-regressions.cjs`。
+- `session.status` 的 `retry` 状态也在界面显式呈现：当前会话在输入框上方显示黄色「模型连接中断」提示，包含尝试次数、倒计时、内核返回的错误摘要；侧栏对应会话带脉动圆点，切到其他会话时提示消失但侧栏标记保留。`retry` 期间仍视为忙碌（保留「停止」），`busy` 只清除提示，`idle` / `session.error` 同时清除提示和标记。主 SSE 断开时输入框上方显示蓝色「与内核的连接中断，正在重连…」，只阻止发送而不禁用输入框：禁用聚焦中的 textarea 会强制结束 IME 组合并把拼音预编辑串上屏；`onCompositionStart/End` 额外保护组合态，组合中不触发提交。`EventSource` 重连成功后重新拉取历史、会话列表与 `/session/status`，弥补断线期间丢失的事件；历史刷新成功会清除同类的常驻「刷新会话历史失败」提示。系统减少动态效果时圆点停止脉动。回归见 `scripts/busy-session-regressions.cjs`。
 
 ### 会话删除
 
